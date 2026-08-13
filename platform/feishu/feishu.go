@@ -1696,6 +1696,24 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 			UserMessageTimeMs: createTimeMs,
 		})
 
+	// [FORK 2026-08-13] Added case for interactive cards (incl. Feishu email-forward cards).
+	// Previously msg_type="interactive" fell through to default and was silently dropped.
+	// extractInteractiveCardText already supports title + elements schemas (line 2241+),
+	// so we just dispatch whatever text it produces to the agent.
+	case "interactive":
+		text := extractInteractiveCardText(content)
+		if text == "" && len(quoted.images) == 0 {
+			slog.Debug(p.tag()+": interactive card produced no content", "message_id", messageID)
+			return
+		}
+		p.dispatchCoreMessage(&core.Message{
+			SessionKey: sessionKey, Platform: p.platformName,
+			MessageID: messageID,
+			UserID:    userID, UserName: userName, ChatName: chatName,
+			Content: text, ExtraContent: quoted.text, Images: quoted.images, ReplyCtx: rctx,
+			UserMessageTimeMs: createTimeMs,
+		})
+
 	default:
 		slog.Debug(p.tag()+": ignoring unsupported message type", "type", msgType)
 	}
@@ -2214,6 +2232,142 @@ func extractPostPlainText(content string) string {
 	return strings.Join(parts, "\n")
 }
 
+// [FORK 2026-08-13] isEmailCard reports whether a card payload is a Feishu
+// email-forward card. These cards expose a card_link to lark://.../mail/forward/card
+// and have no "body" field — content lives in top-level "title" + "elements".
+func isEmailCard(card map[string]json.RawMessage) bool {
+	raw, ok := card["card_link"]
+	if !ok {
+		return false
+	}
+	var link struct {
+		URL string `json:"url"`
+	}
+	if err := json.Unmarshal(raw, &link); err != nil {
+		return false
+	}
+	return strings.Contains(link.URL, "/mail/forward/card")
+}
+
+// [FORK 2026-08-13] formatEmailCardText renders an email-forward card into a
+// structured "[Email] From: <addr>\nSubject: ...\nDate: ..." envelope followed
+// by the message body. The 2D elements array is scanned for "发件人：" / "时间："
+// labels to recover sender + date fragments that Feishu splits into separate
+// elements during rendering.
+//
+// Returns ok=false if required fields are missing (caller falls back to the
+// generic interactive-card extraction).
+func formatEmailCardText(card map[string]json.RawMessage) (string, bool) {
+	// Subject: top-level "title".
+	var subject string
+	if raw, ok := card["title"]; ok {
+		if err := json.Unmarshal(raw, &subject); err != nil {
+			return "", false
+		}
+		subject = strings.TrimSpace(subject)
+	}
+
+	// Walk elements (2D array of text fragments).
+	rawElements, ok := card["elements"]
+	if !ok {
+		return "", subject != ""
+	}
+	var rows [][]json.RawMessage
+	if err := json.Unmarshal(rawElements, &rows); err != nil {
+		return "", subject != ""
+	}
+
+	var (
+		bodyLines    []string
+		currentLine  strings.Builder
+		sender       string
+		date         string
+		expectSender bool
+		expectDate   bool
+	)
+	flushLine := func() {
+		s := strings.TrimSpace(currentLine.String())
+		if s != "" {
+			bodyLines = append(bodyLines, s)
+		}
+		currentLine.Reset()
+	}
+	for _, row := range rows {
+		for _, raw := range row {
+			var elem struct {
+				Tag  string `json:"tag"`
+				Text string `json:"text"`
+			}
+			if err := json.Unmarshal(raw, &elem); err != nil || elem.Tag != "text" {
+				continue
+			}
+			t := elem.Text
+			trimmed := strings.TrimSpace(t)
+			if trimmed == "发件人：" || trimmed == "发件人:" {
+				expectSender = true
+				continue
+			}
+			if trimmed == "时间：" || trimmed == "时间:" {
+				expectDate = true
+				continue
+			}
+			if expectSender {
+				// Sender line often starts with "\n" and wraps "<name> <email>".
+				sender = strings.TrimSpace(t)
+				expectSender = false
+				continue
+			}
+			if expectDate {
+				// Date may be split across multiple text elements (year /
+				// parens / weekday / time). Accumulate until non-empty content
+				// shows a label boundary.
+				date += t
+				if strings.Contains(t, ":") || strings.Contains(t, "：") {
+					expectDate = false
+				}
+				continue
+			}
+			// Body text: accumulate consecutive fragments into a single line.
+			if t == "" {
+				continue
+			}
+			currentLine.WriteString(t)
+		}
+		flushLine()
+	}
+	flushLine()
+
+	if date != "" {
+		date = strings.TrimSpace(date)
+		// Collapse the "（周一）" segments the renderer split apart.
+		date = strings.Join(strings.Fields(date), "")
+	}
+
+	var sb strings.Builder
+	sb.WriteString("[Email]")
+	if sender != "" {
+		sb.WriteString("\nFrom: ")
+		sb.WriteString(sender)
+	}
+	if subject != "" {
+		sb.WriteString("\nSubject: ")
+		sb.WriteString(subject)
+	}
+	if date != "" {
+		sb.WriteString("\nDate: ")
+		sb.WriteString(date)
+	}
+	if len(bodyLines) > 0 {
+		sb.WriteString("\n\n")
+		sb.WriteString(strings.Join(bodyLines, "\n"))
+	}
+	if sb.Len() == len("[Email]") {
+		// No useful fields recovered — let caller fall back.
+		return "", false
+	}
+	return sb.String(), true
+}
+
 // extractInteractiveCardText extracts readable text from a Feishu interactive card JSON.
 // With raw_card_content, the response wraps the card in {"json_card": "...", ...}.
 // Supports schema 2.0 (body.property.elements with recursive nesting) and
@@ -2231,6 +2385,17 @@ func extractInteractiveCardText(content string) string {
 	var card map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(cardJSON), &card); err != nil {
 		return "[interactive card]"
+	}
+
+	// [FORK 2026-08-13] Detect Feishu email-forward cards and emit structured text.
+	// These cards use msg_type="interactive" with a card_link pointing at
+	// lark://.../mail/forward/card. They lack header/body and instead expose
+	// subject via top-level "title" and body as a 2D array of text elements
+	// ("发件人：" / "时间：" labels followed by their values).
+	if isEmailCard(card) {
+		if emailText, ok := formatEmailCardText(card); ok && emailText != "" {
+			return emailText
+		}
 	}
 
 	var parts []string
